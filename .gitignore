@@ -1,0 +1,69 @@
+# ──────────────────────────────────────────────────────────────
+# HR Bot — .gitignore
+# Only the application source files and requirements.txt
+# should be committed. Everything below is excluded.
+# ──────────────────────────────────────────────────────────────
+
+# ── Python bytecode & caches ──────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ── Vendored / pip-installed packages ─────────────────────────
+# (these are installed via requirements.txt — no need to commit)
+boto3/
+botocore/
+certifi/
+charset_normalizer/
+dateutil/
+docx/
+events/
+idna/
+jmespath/
+lxml/
+opensearchpy/
+pypdf/
+requests/
+s3transfer/
+urllib3/
+
+# Standalone vendored modules
+six.py
+typing_extensions.py
+
+# dist-info metadata directories
+*.dist-info/
+
+# bin directory (pip scripts)
+bin/
+
+# ── Old / archived versions ───────────────────────────────────
+hr_bot_v2.0.0-no-pydantic_20261022/
+
+# ── Generated / temporary files ───────────────────────────────
+*.pkl
+*.pickle
+*.zip
+*.tar.gz
+
+# ── Lambda deployment artifacts ───────────────────────────────
+lambda_deployment.zip
+
+# ── OS / editor artifacts ─────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# ── Environment & secrets (safety net) ────────────────────────
+.env
+.env.*
+*.pem
+*.key
+
+# ── Test files ────────────────────────────────────────────────
+test_local.py

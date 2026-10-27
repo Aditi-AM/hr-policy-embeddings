@@ -1,0 +1,11 @@
+# AWS SDK — available in Lambda runtime but pinned here for local dev
+boto3==1.34.0
+# Document parsing — pure Python, no native binary dependencies
+pypdf==6.21.2
+# PDF text extraction
+python-docx==1.1.0
+# DOCX parsing
+# HTTP client — direct AI Gateway API calls (no openai SDK, no pydantic)
+requests==2.34.2
+# Search
+opensearch-py==2.6.0

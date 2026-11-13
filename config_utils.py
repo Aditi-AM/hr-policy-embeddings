@@ -1,22 +1,3 @@
-"""
-Central config loader — pulls all runtime configuration from AWS Secrets Manager.
-
-Only env var required:
-    HR_BOT_CONFIG_SECRET_NAME  (default: "hr-bot-config-dev")
-    ASM_REGION                 (default: "ap-south-1")
-
-Secret schema (hr-bot-config-dev):
-{
-    "opensearch_endpoint":          "https://search-xxx.ap-south-1.es.amazonaws.com",
-    "opensearch_index":             "hr-docs-embeddings",
-    "embedding_dimension":          1536,
-    "ai_gateway_url":               "https://ai.titan.in/gateway",
-    "embed_model":                  "gemini-multimodalembedding",
-    "ai_gateway_token_secret_name": "titan-ess-entrapp-token-dev",
-    "asm_region":                   "ap-south-1"
-}
-"""
-
 import os
 import json
 import logging
@@ -34,7 +15,6 @@ _config: dict = None
 
 
 def get_config() -> dict:
-    """Return the config dict, fetching from ASM on the first call."""
     global _config
     if _config is not None:
         logger.info("[config] get_config: returning cached config")

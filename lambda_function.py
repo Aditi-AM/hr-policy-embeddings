@@ -8,9 +8,9 @@ from urllib.parse import unquote_plus
 
 from s3_utils import download_document, get_object_tags, cleanup_tmp
 from file_handler import process_document
-from ai_gateway_utils import embed_chunks
+from ai_gateway_utils import embed_chunks, _embed_chunks_last_failure_summary
 from opensearch_utils import ensure_index, bulk_index_chunks, delete_chunks_by_s3_key
-from embeddings_log_utils import save_embeddings_log, upload_store_to_s3, delete_embeddings_by_s3_key
+from embeddings_log_utils import save_embeddings_log, delete_embeddings_by_s3_key
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,7 +24,6 @@ def lambda_handler(event, context):
     document_id = str(uuid.uuid4())
     local_path  = None
 
-    # ── Step 0: Parse S3 event ────────────────────────────────────────────────
     try:
         records = event.get("Records")
         if not records or not isinstance(records, list):
@@ -108,7 +107,7 @@ def _handle_ingest(document_id: str, bucket: str, key: str, local_path) -> dict:
         try:
             local_path = download_document(bucket, key)
         except Exception as e:
-            _log_error("s3_download_error", document_id, e)
+            _log_error("s3_download_error", document_id, e, file_name=file_name)
             raise
 
         _log_info("s3_download_complete", document_id, local_path=local_path)
@@ -123,7 +122,7 @@ def _handle_ingest(document_id: str, bucket: str, key: str, local_path) -> dict:
                 "ingested_at":   ingested_at,
             })
         except Exception as e:
-            _log_error("metadata_error", document_id, e)
+            _log_error("metadata_error", document_id, e, file_name=file_name)
             raise
 
         _log_info("metadata_extracted", document_id, metadata=metadata)
@@ -132,7 +131,7 @@ def _handle_ingest(document_id: str, bucket: str, key: str, local_path) -> dict:
         try:
             chunks = process_document(local_path, metadata)
         except Exception as e:
-            _log_error("parsing_error", document_id, e)
+            _log_error("parsing_error", document_id, e, file_name=file_name)
             raise
 
         if not chunks:
@@ -144,7 +143,7 @@ def _handle_ingest(document_id: str, bucket: str, key: str, local_path) -> dict:
         try:
             chunks_with_embeddings = embed_chunks(chunks)
         except Exception as e:
-            _log_error("embedding_fatal_error", document_id, e)
+            _log_error("embedding_fatal_error", document_id, e, file_name=file_name)
             raise
 
         _log_info("embeddings_generated", document_id,
@@ -152,16 +151,25 @@ def _handle_ingest(document_id: str, bucket: str, key: str, local_path) -> dict:
                   skipped=len(chunks) - len(chunks_with_embeddings))
 
         if not chunks_with_embeddings:
+            failure_summary = _embed_chunks_last_failure_summary[0] or "see per-chunk ERROR logs above"
             raise RuntimeError(
                 f"All {len(chunks)} chunk(s) failed embedding for "
-                f"document_id={document_id}. Nothing to index."
+                f"file_name={file_name} document_id={document_id}. "
+                f"Nothing to index. Causes: {failure_summary}"
             )
 
-        # ── Step 4b: Save embeddings log to PKL (non-fatal) ───────────────────
-        log_path = None
+        # ── Step 4b: Save embeddings to this document's own PKL (non-fatal) ──
+        # Each ingest writes its OWN file — "{sanitized_key}__{document_id}.pkl"
+        # under embeddings-store/ — instead of merging into one shared file.
+        # No read-modify-write race between Lambda containers, and the pkl
+        # count directly matches the number of successful ingests. This runs
+        # regardless of OpenSearch availability.
+        log_path     = None
+        store_s3_key = None
         try:
-            log_path = save_embeddings_log(chunks_with_embeddings, document_id)
-            _log_info("embeddings_log_saved", document_id, log_path=log_path)
+            log_path = save_embeddings_log(chunks_with_embeddings, document_id, bucket=bucket)
+            store_s3_key = f"embeddings-store/{os.path.basename(log_path)}"
+            _log_info("embeddings_log_saved", document_id, log_path=log_path, s3_key=store_s3_key)
         except Exception as e:
             logger.warning(json.dumps({
                 "stage":       "embeddings_log_failed",
@@ -170,9 +178,8 @@ def _handle_ingest(document_id: str, bucket: str, key: str, local_path) -> dict:
                 "hint":        "PKL log not written — indexing will continue.",
             }))
 
-        # ── Step 5: Index to OpenSearch (fall back to S3 pkl if unavailable) ──
+        # ── Step 5: Index to OpenSearch (pkl store above is kept regardless) ──
         indexed_count        = 0
-        store_s3_key         = None
         opensearch_available = True
 
         try:
@@ -182,14 +189,8 @@ def _handle_ingest(document_id: str, bucket: str, key: str, local_path) -> dict:
         except Exception as e:
             opensearch_available = False
             _log_error("opensearch_error", document_id, e,
-                       hint="OpenSearch unavailable — falling back to S3 pkl.")
-
-        if not opensearch_available and log_path:
-            try:
-                store_s3_key = upload_store_to_s3(log_path, bucket)
-                _log_info("embeddings_store_uploaded", document_id, s3_key=store_s3_key)
-            except Exception as e:
-                _log_error("embeddings_store_upload_failed", document_id, e)
+                       hint="OpenSearch unavailable — this document's PKL in S3 still has its embeddings.",
+                       file_name=file_name)
 
         return {
             "statusCode": 200,
@@ -269,13 +270,15 @@ def _log_info(stage: str, document_id: str, **kwargs) -> None:
     logger.info(json.dumps({"stage": stage, "document_id": document_id, **kwargs}))
 
 
-def _log_error(stage: str, document_id: str, error: Exception, hint: str = "") -> None:
+def _log_error(stage: str, document_id: str, error: Exception, hint: str = "", file_name: str = "") -> None:
     payload = {
         "stage":       stage,
         "document_id": document_id,
         "error_type":  type(error).__name__,
         "error":       str(error),
     }
+    if file_name:
+        payload["file_name"] = file_name
     if hint:
         payload["hint"] = hint
     logger.error(json.dumps(payload))

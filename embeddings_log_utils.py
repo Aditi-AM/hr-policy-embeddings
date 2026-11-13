@@ -1,117 +1,136 @@
-"""
-embeddings_log_utils.py
------------------------
-Append embedded chunks to a single persistent pickle file so every
-document processed accumulates in one place.
-
-Fixed file name:  embeddings_store.pkl  (in the project dir locally,
-                  or /tmp when running inside AWS Lambda)
-
-Stored object: list of dicts, growing with every run:
-{
-    "chunk_id":       "...",
-    "document_id":    "...",
-    "file_name":      "policy.pdf",
-    "department":     "HR",
-    "policy_type":    "leave",
-    "effective_date": "2024-01-01",
-    "file_type":      "pdf",
-    "ingested_at":    "2024-10-22T10:30:00+00:00",
-    "source_s3_key":  "referral.pdf",
-    "chunk_index":    0,
-    "text_content":   "...",
-    "embedding_dim":  1536,
-    "embedding":      [0.012, -0.034, ...]
-}
-
-To load in Python:
-    import pickle
-    with open("embeddings_store.pkl", "rb") as f:
-        all_chunks = pickle.load(f)
-"""
 
 import json
 import pickle
 import logging
 import os
+import re
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Single fixed file — grows across runs
-STORE_FILENAME = "embeddings_store.pkl"
-OUTPUT_DIR     = "/tmp" if os.environ.get("AWS_LAMBDA_FUNCTION_NAME") else "."
+STORE_SUBDIR = "embeddings-store"          # folder name, used both locally and as the S3 prefix
+OUTPUT_DIR   = "/tmp" if os.environ.get("AWS_LAMBDA_FUNCTION_NAME") else "."
+
+
+def _sanitize_key(s3_key: str) -> str:
+    """Turn an S3 key into a filesystem-safe fragment: 'hr/policy.pdf' -> 'hr__policy.pdf'."""
+    safe = s3_key.strip().replace("/", "__")
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", safe)
+    return safe or "unknown-key"
+
+
+def _store_dir(output_dir: str) -> str:
+    path = os.path.join(output_dir, STORE_SUBDIR)
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def save_embeddings_log(
     chunks: List[Dict[str, Any]],
     document_id: str,
     output_dir: str = OUTPUT_DIR,
+    bucket: str = None,
+    s3_prefix: str = STORE_SUBDIR,
+    replace_existing: bool = True,
 ) -> str:
     """
-    Append embedded chunks to the persistent store file.
+    Write this document's embedded chunks to their OWN pickle file — never
+    touches or depends on any other document's pkl, so there is no
+    read-modify-write race between Lambda containers and nothing can be
+    silently overwritten.
 
-    If the store file already exists its contents are loaded first,
-    then the new chunks are added and the whole list is saved back.
+    File name: "{sanitized(source_s3_key)}__{document_id}.pkl"
+
+    If a document with the same "source_s3_key" was already ingested before
+    (e.g. the file was re-uploaded/overwritten in S3), its OLDER pkl(s) are
+    deleted first — so the store ends up with exactly one pkl per
+    currently-existing S3 object, not one per historical upload.
 
     Args:
         chunks:      List of chunk dicts that already contain an "embedding" key.
-        document_id: Unique ID for this ingestion run (used only for logging).
-        output_dir:  Directory for the store file. Defaults to project dir locally,
-                     /tmp inside Lambda.
+                     All chunks are expected to belong to the same document
+                     (same "source_s3_key" / "document_id").
+        document_id: Unique ID for this ingestion run — becomes part of the filename.
+        output_dir:  Base directory for the local store. Defaults to project
+                     dir locally, /tmp inside Lambda. The pkl is written to
+                     "{output_dir}/{s3_prefix}/{filename}".
+        bucket:      S3 bucket to upload the pkl to. If omitted, only the
+                     local file is written (no S3 round-trip), and no old
+                     remote pkl can be cleaned up either.
+        s3_prefix:   S3 key prefix / local subfolder name (default: "embeddings-store").
+        replace_existing: If True (default), delete any prior pkl(s) for this
+                     document's "source_s3_key" before writing the new one.
+                     Set False to keep full upload history instead.
 
     Returns:
-        Absolute path of the store file.
+        Absolute local path of the pkl file that was written.
 
     Raises:
         ValueError: chunks is None/empty or document_id is blank.
-        OSError:    Cannot read/write the store file.
+        OSError:    Cannot write the local pkl file.
     """
     if not chunks or not isinstance(chunks, list):
         raise ValueError("save_embeddings_log: chunks must be a non-empty list.")
     if not document_id or not isinstance(document_id, str):
         raise ValueError(f"save_embeddings_log: invalid document_id: {document_id!r}")
 
-    os.makedirs(output_dir, exist_ok=True)
-    store_path = os.path.join(output_dir, STORE_FILENAME)
+    source_s3_key = chunks[0].get("source_s3_key") or "unknown-key"
+    file_name     = chunks[0].get("file_name") or source_s3_key
 
-    # Load existing records if the store already exists
-    existing: List[Dict[str, Any]] = []
-    if os.path.exists(store_path):
+    filename   = f"{_sanitize_key(source_s3_key)}__{document_id}.pkl"
+    store_dir  = _store_dir(output_dir)
+    store_path = os.path.join(store_dir, filename)
+
+    # ── Replace, don't accumulate: drop this document's previous pkl(s) ────
+    # New document_id each run means the new filename never collides with an
+    # old one, so without this step a re-uploaded file would pile up pkls
+    # instead of being replaced.
+    if replace_existing:
         try:
-            with open(store_path, "rb") as f:
-                existing = pickle.load(f)
-            if not isinstance(existing, list):
-                logger.warning(f"Store file had unexpected type — starting fresh.")
-                existing = []
+            files_removed, _ = _purge_pkls_for_key(
+                source_s3_key, bucket=bucket, output_dir=output_dir, s3_prefix=s3_prefix,
+            )
+            if files_removed:
+                logger.info(json.dumps({
+                    "stage":          "embeddings_prior_pkl_replaced",
+                    "document_id":    document_id,
+                    "source_s3_key":  source_s3_key,
+                    "files_replaced": files_removed,
+                }))
         except Exception as e:
-            logger.warning(f"Could not read existing store ({e}) — starting fresh.")
-            existing = []
+            logger.warning(f"Could not purge prior pkl(s) for '{source_s3_key}' ({e}) — continuing anyway.")
 
-    new_records = [_to_log_record(chunk) for chunk in chunks]
-    combined    = existing + new_records
+    records = [_to_log_record(chunk) for chunk in chunks]
 
     try:
         with open(store_path, "wb") as f:
-            pickle.dump(combined, f)
+            pickle.dump(records, f)
     except OSError as e:
-        raise OSError(f"Failed to write embeddings store to {store_path}: {e}") from e
+        raise OSError(f"Failed to write embeddings pkl to {store_path}: {e}") from e
 
     size_kb = os.path.getsize(store_path) / 1024
     logger.info(json.dumps({
-        "stage":            "embeddings_log_saved",
-        "document_id":      document_id,
-        "store_path":       store_path,
-        "new_chunks":       len(new_records),
-        "total_chunks":     len(combined),
-        "file_size_kb":     round(size_kb, 1),
+        "stage":          "embeddings_log_saved",
+        "document_id":    document_id,
+        "file_name":      file_name,
+        "source_s3_key":  source_s3_key,
+        "store_path":     store_path,
+        "chunk_count":    len(records),
+        "file_size_kb":   round(size_kb, 1),
     }))
     print(
-        f"\n📄 Embeddings store updated → {store_path}  "
-        f"(+{len(new_records)} new  |  {len(combined)} total  |  {size_kb:.1f} KB)\n"
+        f"\n📄 Embeddings pkl created → {store_path}  "
+        f"(document='{file_name}'  |  {len(records)} chunk(s)  |  {size_kb:.1f} KB)\n"
     )
+
+    if bucket:
+        try:
+            upload_store_to_s3(store_path, bucket, s3_prefix)
+        except Exception as e:
+            logger.warning(f"Could not upload pkl '{filename}' to S3 ({e}).")
+
     return store_path
 
 
@@ -135,12 +154,9 @@ def _to_log_record(chunk: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def upload_store_to_s3(store_path: str, bucket: str, s3_prefix: str = "embeddings-store") -> str:
+def upload_store_to_s3(store_path: str, bucket: str, s3_prefix: str = STORE_SUBDIR) -> str:
     """
-    Upload the local embeddings store pkl to S3.
-
-    Used as a fallback when OpenSearch is not configured — the pkl lands in S3
-    so it is not lost when the Lambda container shuts down.
+    Upload one document's pkl file to S3 at "{s3_prefix}/{filename}".
 
     Args:
         store_path: Local path to the pkl file.
@@ -157,13 +173,13 @@ def upload_store_to_s3(store_path: str, bucket: str, s3_prefix: str = "embedding
     filename = os.path.basename(store_path)
     s3_key   = f"{s3_prefix}/{filename}"
 
-    logger.info(f"Uploading embeddings store → s3://{bucket}/{s3_key}")
+    logger.info(f"Uploading embeddings pkl → s3://{bucket}/{s3_key}")
     try:
         s3 = boto3.client("s3", verify=False)
         s3.upload_file(store_path, bucket, s3_key)
     except NoCredentialsError as e:
         raise PermissionError(
-            "No AWS credentials found while uploading embeddings store."
+            "No AWS credentials found while uploading embeddings pkl."
         ) from e
     except ClientError as e:
         code = e.response["Error"]["Code"]
@@ -177,136 +193,199 @@ def upload_store_to_s3(store_path: str, bucket: str, s3_prefix: str = "embedding
         ) from e
 
     logger.info(json.dumps({
-        "stage":    "embeddings_store_uploaded_to_s3",
-        "s3_key":   s3_key,
-        "bucket":   bucket,
+        "stage":  "embeddings_pkl_uploaded_to_s3",
+        "s3_key": s3_key,
+        "bucket": bucket,
     }))
-    print(f"☁️  Embeddings store uploaded → s3://{bucket}/{s3_key}\n")
+    print(f"☁️  Embeddings pkl uploaded → s3://{bucket}/{s3_key}\n")
     return s3_key
+
+
+def _purge_pkls_for_key(
+    s3_key: str,
+    bucket: Optional[str],
+    output_dir: str = OUTPUT_DIR,
+    s3_prefix: str = STORE_SUBDIR,
+) -> Tuple[int, int]:
+    """
+    Delete every pkl whose filename starts with "{sanitized(s3_key)}__",
+    both locally and (if a bucket is given) in S3. Shared by
+    save_embeddings_log() (replace-on-reingest) and
+    delete_embeddings_by_s3_key() (removal on S3 delete event).
+
+    Returns:
+        (files_removed, chunks_removed)
+    """
+    prefix_match   = f"{_sanitize_key(s3_key)}__"
+    store_dir      = _store_dir(output_dir)
+    removed_chunks = 0
+    matched_files  = 0
+    counted_names: set = set()
+
+    # ── Local matches ──────────────────────────────────────────────────────
+    try:
+        for fname in os.listdir(store_dir):
+            if fname.startswith(prefix_match) and fname.endswith(".pkl"):
+                local_path = os.path.join(store_dir, fname)
+                try:
+                    with open(local_path, "rb") as f:
+                        data = pickle.load(f)
+                    if isinstance(data, list):
+                        removed_chunks += len(data)
+                except Exception as e:
+                    logger.warning(f"Could not read '{fname}' before deleting it ({e}).")
+                try:
+                    os.remove(local_path)
+                    matched_files += 1
+                    counted_names.add(fname)
+                except OSError as e:
+                    logger.warning(f"Could not remove local pkl '{local_path}' ({e}).")
+    except FileNotFoundError:
+        pass
+
+    # ── S3 matches ────────────────────────────────────────────────────────
+    if bucket:
+        try:
+            s3 = boto3.client("s3", verify=False)
+            paginator = s3.get_paginator("list_objects_v2")
+            remote_prefix = f"{s3_prefix}/{prefix_match}"
+            for page in paginator.paginate(Bucket=bucket, Prefix=remote_prefix):
+                for obj in page.get("Contents", []):
+                    key   = obj["Key"]
+                    fname = key.rsplit("/", 1)[-1]
+                    if fname not in counted_names:
+                        try:
+                            resp = s3.get_object(Bucket=bucket, Key=key)
+                            data = pickle.loads(resp["Body"].read())
+                            if isinstance(data, list):
+                                removed_chunks += len(data)
+                        except Exception as e:
+                            logger.warning(f"Could not read s3://{bucket}/{key} before deleting it ({e}).")
+                    try:
+                        s3.delete_object(Bucket=bucket, Key=key)
+                        matched_files += 1
+                        counted_names.add(fname)
+                    except ClientError as e:
+                        logger.warning(f"Could not delete s3://{bucket}/{key} ({e}).")
+        except (NoCredentialsError, ClientError) as e:
+            logger.warning(f"Could not reach S3 to clean up pkls ({e}).")
+        except Exception as e:
+            # Covers SSO/credential-refresh failures (e.g. UnauthorizedSSOTokenError)
+            # and any other unexpected boto3 error — local deletion above still
+            # succeeded, so this is logged but non-fatal.
+            logger.warning(f"Unexpected error cleaning up S3 pkls for '{s3_key}' ({e}).")
+
+    return matched_files, removed_chunks
 
 
 def delete_embeddings_by_s3_key(
     s3_key: str,
     bucket: str,
     output_dir: str = OUTPUT_DIR,
-    s3_prefix: str = "embeddings-store",
+    s3_prefix: str = STORE_SUBDIR,
 ) -> int:
-    """
-    Remove all chunks for a given S3 object key from the persistent store.
 
-    Strategy:
-      1. Try to load the store from the local output_dir (warm Lambda container).
-      2. If not found locally, download it from S3 first.
-      3. Filter out every record whose source_s3_key matches s3_key.
-      4. Write the filtered list back to disk and re-upload to S3.
-
-    Args:
-        s3_key:     The S3 object key of the deleted document (e.g. "hr/policy.pdf").
-        bucket:     The S3 bucket — used to download/re-upload the store.
-        output_dir: Local directory for the store file.
-        s3_prefix:  S3 key prefix where the store is kept.
-
-    Returns:
-        Number of chunks removed.
-
-    Raises:
-        ValueError:      s3_key or bucket is blank.
-        RuntimeError:    Store file not found locally or in S3.
-        OSError:         Cannot read/write the local store file.
-        PermissionError: No AWS credentials or access denied.
-    """
     if not s3_key or not isinstance(s3_key, str):
         raise ValueError(f"delete_embeddings_by_s3_key: invalid s3_key: {s3_key!r}")
     if not bucket or not isinstance(bucket, str):
         raise ValueError(f"delete_embeddings_by_s3_key: invalid bucket: {bucket!r}")
 
-    os.makedirs(output_dir, exist_ok=True)
-    store_path = os.path.join(output_dir, STORE_FILENAME)
+    matched_files, removed_chunks = _purge_pkls_for_key(
+        s3_key, bucket=bucket, output_dir=output_dir, s3_prefix=s3_prefix,
+    )
 
-    # ── Step 1: Ensure we have a local copy ────────────────────────────────
-    if not os.path.exists(store_path):
-        remote_key = f"{s3_prefix}/{STORE_FILENAME}"
-        logger.info(f"Store not found locally — downloading s3://{bucket}/{remote_key}")
-        try:
-            s3 = boto3.client("s3", verify=False)
-            s3.download_file(bucket, remote_key, store_path)
-        except NoCredentialsError as e:
-            raise PermissionError(
-                "No AWS credentials found while downloading embeddings store."
-            ) from e
-        except ClientError as e:
-            code = e.response["Error"]["Code"]
-            if code in ("404", "NoSuchKey"):
-                raise RuntimeError(
-                    f"Embeddings store not found at s3://{bucket}/{remote_key}. "
-                    "Nothing to delete."
-                ) from e
-            if code == "403":
-                raise PermissionError(
-                    f"Access denied downloading s3://{bucket}/{remote_key}."
-                ) from e
-            raise RuntimeError(
-                f"S3 download failed for s3://{bucket}/{remote_key} — Code: {code}"
-            ) from e
-
-    # ── Step 2: Load ────────────────────────────────────────────────────────
-    try:
-        with open(store_path, "rb") as f:
-            all_chunks: List[Dict[str, Any]] = pickle.load(f)
-        if not isinstance(all_chunks, list):
-            logger.warning("Store file had unexpected type — treating as empty.")
-            all_chunks = []
-    except Exception as e:
-        raise OSError(f"Failed to read embeddings store from {store_path}: {e}") from e
-
-    before = len(all_chunks)
-
-    # ── Step 3: Filter ──────────────────────────────────────────────────────
-    filtered = [c for c in all_chunks if c.get("source_s3_key") != s3_key]
-    removed  = before - len(filtered)
-
-    if removed == 0:
-        logger.warning(
-            json.dumps({
-                "stage":   "delete_embeddings_no_match",
-                "s3_key":  s3_key,
-                "message": "No chunks matched — store unchanged.",
-            })
-        )
+    if matched_files == 0:
+        logger.warning(json.dumps({
+            "stage":   "delete_embeddings_no_match",
+            "s3_key":  s3_key,
+            "message": "No pkl file(s) matched — nothing to delete.",
+        }))
         return 0
 
-    # ── Step 4: Save locally ────────────────────────────────────────────────
-    try:
-        with open(store_path, "wb") as f:
-            pickle.dump(filtered, f)
-    except OSError as e:
-        raise OSError(f"Failed to write filtered store to {store_path}: {e}") from e
-
-    size_kb = os.path.getsize(store_path) / 1024
     logger.info(json.dumps({
-        "stage":          "delete_embeddings_saved",
+        "stage":          "delete_embeddings_complete",
         "s3_key":         s3_key,
-        "chunks_removed": removed,
-        "chunks_remaining": len(filtered),
-        "file_size_kb":   round(size_kb, 1),
+        "files_removed":  matched_files,
+        "chunks_removed": removed_chunks,
     }))
+    print(f"\n🗑️  Embeddings deleted for '{s3_key}'  ({matched_files} file(s), {removed_chunks} chunk(s))\n")
+    return removed_chunks
 
-    # ── Step 5: Re-upload to S3 ─────────────────────────────────────────────
-    try:
-        upload_store_to_s3(store_path, bucket, s3_prefix)
-    except Exception as e:
-        # Non-fatal: local store is correct; log and continue.
-        logger.warning(
-            json.dumps({
-                "stage":   "delete_embeddings_upload_failed",
-                "s3_key":  s3_key,
-                "error":   str(e),
-                "hint":    "Local store updated but S3 re-upload failed.",
+
+def get_store_summary(
+    output_dir: str = OUTPUT_DIR,
+    bucket: Optional[str] = None,
+    s3_prefix: str = STORE_SUBDIR,
+) -> Dict[str, Any]:
+    """
+    Build a verification report: how many documents have embeddings stored,
+    how many chunks in total, and a per-document breakdown. Reads from S3 if
+    a bucket is given (the authoritative view across all Lambda containers),
+    otherwise from the local store directory.
+
+    Returns:
+        {
+            "document_count": int,
+            "total_chunks":   int,
+            "documents": [
+                {
+                    "pkl_key":       "embeddings-store/hr__policy.pdf__<uuid>.pkl",
+                    "file_name":     "policy.pdf",
+                    "document_id":  "<uuid>",
+                    "source_s3_key": "hr/policy.pdf",
+                    "chunk_count":  12,
+                },
+                ...
+            ],
+        }
+    """
+    documents: List[Dict[str, Any]] = []
+
+    def _summarize(pkl_key: str, raw_bytes: bytes) -> None:
+        try:
+            data = pickle.loads(raw_bytes)
+        except Exception as e:
+            logger.warning(f"Could not unpickle '{pkl_key}' for summary ({e}).")
+            return
+        if not isinstance(data, list) or not data:
+            documents.append({
+                "pkl_key": pkl_key, "file_name": None, "document_id": None,
+                "source_s3_key": None, "chunk_count": 0,
             })
-        )
+            return
+        first = data[0]
+        documents.append({
+            "pkl_key":       pkl_key,
+            "file_name":     first.get("file_name"),
+            "document_id":   first.get("document_id"),
+            "source_s3_key": first.get("source_s3_key"),
+            "chunk_count":   len(data),
+        })
 
-    print(
-        f"\n🗑️  Embeddings deleted for '{s3_key}'  "
-        f"(removed {removed}  |  {len(filtered)} remaining  |  {size_kb:.1f} KB)\n"
-    )
-    return removed
+    if bucket:
+        try:
+            s3 = boto3.client("s3", verify=False)
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket, Prefix=f"{s3_prefix}/"):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if not key.endswith(".pkl"):
+                        continue
+                    resp = s3.get_object(Bucket=bucket, Key=key)
+                    _summarize(key, resp["Body"].read())
+        except Exception as e:
+            logger.warning(f"Could not list S3 store for summary ({e}) — falling back to local.")
+
+    if not bucket or not documents:
+        store_dir = _store_dir(output_dir)
+        for fname in sorted(os.listdir(store_dir)):
+            if not fname.endswith(".pkl"):
+                continue
+            with open(os.path.join(store_dir, fname), "rb") as f:
+                _summarize(f"{s3_prefix}/{fname}", f.read())
+
+    return {
+        "document_count": len(documents),
+        "total_chunks":   sum(d["chunk_count"] for d in documents),
+        "documents":      documents,
+    }

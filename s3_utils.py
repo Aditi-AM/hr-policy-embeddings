@@ -279,11 +279,16 @@ def get_object_tags(bucket: str, key: str) -> dict:
 
 def cleanup_tmp(local_path: str) -> None:
     """
-    Remove the main document from /tmp and any page images generated
-    during PDF processing (page_0.png, page_1.png, …).
+    Remove the main document and any page images generated during PDF
+    processing (page_*.png files written by file_handler._process_pdf_as_images).
+
+    Page images are always written to /tmp/ regardless of where the PDF was
+    downloaded, so /tmp/ is always scanned.  If local_path lives outside /tmp/
+    (e.g. a developer's macOS temp dir) that directory is scanned as well so no
+    PNG files are orphaned.
 
     Args:
-        local_path: Path to the primary file to delete.
+        local_path: Path to the primary downloaded file to delete.
 
     Raises:
         ValueError: local_path is None or empty.
@@ -293,6 +298,7 @@ def cleanup_tmp(local_path: str) -> None:
     if not local_path:
         raise ValueError("cleanup_tmp received an empty local_path — nothing to clean up.")
 
+    # ── Remove the main document ──────────────────────────────────────────────
     try:
         _safe_remove(local_path)
     except Exception as e:
@@ -301,26 +307,35 @@ def cleanup_tmp(local_path: str) -> None:
             f"type={type(e).__name__} error={e}\n{traceback.format_exc()}"
         )
 
-    # Remove any page images created by the PDF parser
-    tmp_dir = "/tmp"
-    try:
-        entries = os.listdir(tmp_dir)
-    except OSError as e:
-        logger.warning(
-            f"[s3] cleanup_tmp: could not list {tmp_dir} for page image cleanup — "
-            f"error={e}\n{traceback.format_exc()}"
-        )
-        return
+    # ── Collect directories to scan for page images ───────────────────────────
+    # Always include /tmp (where _process_pdf_as_images writes its PNGs).
+    # Also include the directory that held local_path when it differs from /tmp
+    # so that local/dev runs are fully cleaned up.
+    scan_dirs = ["/tmp"]
+    doc_dir   = os.path.dirname(os.path.abspath(local_path))
+    if doc_dir != "/tmp" and doc_dir not in scan_dirs:
+        scan_dirs.append(doc_dir)
 
-    for fname in entries:
-        if fname.startswith("page_") and fname.endswith(".png"):
-            try:
-                _safe_remove(os.path.join(tmp_dir, fname))
-            except Exception as e:
-                logger.warning(
-                    f"[s3] cleanup_tmp: failed to remove page image '{fname}' — "
-                    f"type={type(e).__name__} error={e}"
-                )
+    for scan_dir in scan_dirs:
+        try:
+            entries = os.listdir(scan_dir)
+        except OSError as e:
+            logger.warning(
+                f"[s3] cleanup_tmp: could not list '{scan_dir}' for page image "
+                f"cleanup — error={e}\n{traceback.format_exc()}"
+            )
+            continue
+
+        for fname in entries:
+            if fname.startswith("page_") and fname.endswith(".png"):
+                try:
+                    _safe_remove(os.path.join(scan_dir, fname))
+                except Exception as e:
+                    logger.warning(
+                        f"[s3] cleanup_tmp: failed to remove page image "
+                        f"'{fname}' from '{scan_dir}' — "
+                        f"type={type(e).__name__} error={e}"
+                    )
 
     logger.info(f"[s3] cleanup_tmp: cleanup complete for '{local_path}'")
 
